@@ -105,21 +105,47 @@ def calculate_position_size(stoploss_distance):
     return round(config.RISK_PER_TRADE / stoploss_distance)
 
 
-def place_order(kite, symbol, action, quantity):
-    """Simulates placing an order."""
-    logging.info(f"Placing {action} order for {quantity} shares of {symbol}.")
-    # In a real implementation, you would use kite.place_order()
-    # example:
-    # kite.place_order(
-    #     variety=kite.VARIETY_REGULAR,
-    #     exchange=kite.EXCHANGE_NSE,
-    #     tradingsymbol=symbol,
-    #     transaction_type=action,
-    #     quantity=quantity,
-    #     product=kite.PRODUCT_MIS,
-    #     order_type=kite.ORDER_TYPE_MARKET,
-    # )
-    return True
+def place_market_order(kite, symbol, action, quantity):
+    """Places a simple market order."""
+    logging.info(f"Placing {action} market order for {quantity} shares of {symbol}.")
+    try:
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=symbol,
+            transaction_type=action,
+            quantity=quantity,
+            product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_MARKET,
+        )
+        logging.info(f"Market order placed successfully. Order ID: {order_id}")
+        return order_id
+    except Exception as e:
+        logging.error(f"Error placing market order for {symbol}: {e}")
+        return None
+
+
+def place_bracket_order(kite, symbol, quantity, sl_distance, target_distance):
+    """Places a Bracket Order for a short position."""
+    logging.info(f"Placing Bracket Order for {quantity} shares of {symbol}.")
+    logging.info(f"  SL distance: {sl_distance:.2f}, Target distance: {target_distance:.2f}")
+    try:
+        order_id = kite.place_order(
+            variety=kite.VARIETY_BO,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_SELL, # Short position
+            quantity=quantity,
+            product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_MARKET,
+            stoploss=round(sl_distance, 2),
+            squareoff=round(target_distance, 2)
+        )
+        logging.info(f"Bracket Order placed successfully. Order ID: {order_id}")
+        return order_id
+    except Exception as e:
+        logging.error(f"Error placing Bracket Order for {symbol}: {e}")
+        return None
 
 
 def square_off_all_positions(kite):
@@ -128,13 +154,13 @@ def square_off_all_positions(kite):
     try:
         positions = kite.positions().get("net", [])
         for pos in positions:
-            if pos["quantity"] != 0:
+            if pos["quantity"] != 0 and pos["product"] == kite.PRODUCT_MIS:
                 # For short positions, quantity is negative
                 if pos["quantity"] < 0:
-                    place_order(kite, pos["tradingsymbol"], "BUY", abs(pos["quantity"]))
+                    place_market_order(kite, pos["tradingsymbol"], "BUY", abs(pos["quantity"]))
                 # The strategy is short-only, but as a safeguard:
                 elif pos["quantity"] > 0:
-                    place_order(kite, pos["tradingsymbol"], "SELL", pos["quantity"])
+                    place_market_order(kite, pos["tradingsymbol"], "SELL", pos["quantity"])
         logging.info("All positions squared off.")
     except Exception as e:
         logging.error(f"Error squaring off positions: {e}")
@@ -188,12 +214,18 @@ def run_strategy(kite):
                     logging.info(f"  Target: {target_price:.2f}")
                     logging.info(f"  Position Size: {position_size}")
 
-                    # Place sell order
-                    place_order(kite, stock_symbol, "SELL", position_size)
+                    # Place Bracket Order
+                    target_distance = 2 * stoploss_distance
+                    order_placed = place_bracket_order(
+                        kite,
+                        stock_symbol,
+                        position_size,
+                        stoploss_distance,
+                        target_distance
+                    )
 
-                    # Here you would also place SL and Target orders (e.g., using GTT or bracket orders)
-
-                    traded_stocks.add(stock_symbol)
+                    if order_placed:
+                        traded_stocks.add(stock_symbol)
 
         logging.info("Waiting for the next candle...")
         time.sleep(180)  # Wait for 3 minutes
