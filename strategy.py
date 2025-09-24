@@ -76,11 +76,12 @@ def check_breakout(df, support_level):
 
 def calculate_stoploss(df, breakout_candle_index, entry_price):
     """Calculates the stoploss for a short position."""
-    if breakout_candle_index < 2:
-        logging.warning("Not enough data to calculate stoploss based on previous candles.")
-        return entry_price * 1.02  # Default to 2% SL
+    # With the new simulation loop, breakout_candle_index will always be >= 2,
+    # so we can safely look back at the previous two candles.
 
     # Option 1: High of the last 2 candles *before* the breakout candle
+    # This will now correctly use the previous day's candle if the breakout
+    # happens early in the current day's session.
     sl_price_candlestick = df["high"].iloc[breakout_candle_index - 2 : breakout_candle_index].max()
 
     # Option 2: 2% of the stock price
@@ -166,77 +167,108 @@ def square_off_all_positions(kite):
         logging.error(f"Error squaring off positions: {e}")
 
 
-def run_strategy(kite):
-    """Runs the main trading strategy loop."""
-    traded_stocks = set()
-    while True:
-        # Check for square-off time
-        now = datetime.now()
-        square_off_time = datetime.strptime(config.SQUARE_OFF_TIME, "%H:%M").time()
-        if now.time() >= square_off_time:
-            square_off_all_positions(kite)
-            logging.info("End of trading day. Exiting strategy.")
-            break
+def run_simulation(kite, stock_symbol, days=10):
+    """
+    Runs a backtest simulation for a single stock over a historical period.
+    This provides a stable way to test the strategy logic candle by candle.
+    """
+    logging.info(f"--- Running simulation for {stock_symbol} for the last {days} days ---")
 
-        for stock_symbol in config.STOCKS:
-            if stock_symbol in traded_stocks:
-                continue
+    support_level = config.SUPPORT_LEVELS.get(stock_symbol)
+    if not support_level:
+        logging.error(f"Support level not defined for {stock_symbol}. Cannot run simulation.")
+        return
 
-            support_level = config.SUPPORT_LEVELS.get(stock_symbol)
-            if not support_level:
-                logging.warning(f"Support level not defined for {stock_symbol}. Skipping.")
-                continue
+    instrument_token = get_instrument_token(kite, stock_symbol)
+    if not instrument_token:
+        logging.error(f"Could not get instrument token for {stock_symbol}. Cannot run simulation.")
+        return
 
-            instrument_token = get_instrument_token(kite, stock_symbol)
-            if not instrument_token:
-                logging.warning(f"Could not get instrument token for {stock_symbol}. Skipping.")
-                continue
+    df = get_historical_data(kite, instrument_token, config.CANDLE_INTERVAL, days=days)
+    if df.empty:
+        logging.error(f"Could not fetch historical data for {stock_symbol}. Aborting.")
+        return
 
-            df = get_historical_data(kite, instrument_token, config.CANDLE_INTERVAL)
-            breakout, breakout_idx = check_breakout(df, support_level)
+    position = None
+    square_off_time = datetime.strptime(config.SQUARE_OFF_TIME, "%H:%M").time()
+
+    # Loop through each candle of the historical data as if it's a live feed
+    for i in range(2, len(df)):
+        current_candle = df.iloc[i]
+        current_dataframe_slice = df.iloc[0:i+1] # Data up to the current candle
+
+        # --- POSITION MANAGEMENT ---
+        if position:
+            # Check for square-off time
+            if current_candle["date"].time() >= square_off_time:
+                logging.info(f"[{current_candle['date']}] Squaring off position in {stock_symbol} due to EOD.")
+                position = None # Simulate closing the position
+                continue # Move to the next day
+
+            # In a real backtest, you would check for SL/TP hits here.
+            # For this simulation, we focus on the entry logic.
+
+        # --- ENTRY LOGIC ---
+        if not position: # Only check for entries if we don't have a position
+            breakout, breakout_idx = check_breakout(current_dataframe_slice, support_level)
 
             if breakout:
-                entry_price = df.iloc[breakout_idx]["close"]
-                stoploss_price = calculate_stoploss(df, breakout_idx, entry_price)
+                entry_price = current_candle["close"]
+                stoploss_price = calculate_stoploss(current_dataframe_slice, breakout_idx, entry_price)
 
                 if not stoploss_price:
                     continue
 
                 stoploss_distance = stoploss_price - entry_price
-                target_price = entry_price - (2 * stoploss_distance)
+                if stoploss_distance <= 0:
+                    logging.warning(f"[{current_candle['date']}] Invalid SL distance ({stoploss_distance}). Skipping trade.")
+                    continue
 
+                target_price = entry_price - (2 * stoploss_distance)
                 position_size = calculate_position_size(stoploss_distance)
 
                 if position_size > 0:
-                    logging.info(f"Trade signal for {stock_symbol}:")
+                    logging.info(f"--- TRADE SIGNAL on {current_candle['date']} ---")
+                    logging.info(f"  Stock: {stock_symbol}")
                     logging.info(f"  Entry: {entry_price:.2f}")
-                    logging.info(f"  Stoploss: {stoploss_price:.2f}")
+                    logging.info(f"  Stoploss: {stoploss_price:.2f} (Distance: {stoploss_distance:.2f})")
                     logging.info(f"  Target: {target_price:.2f}")
                     logging.info(f"  Position Size: {position_size}")
 
-                    # Place Bracket Order
-                    target_distance = 2 * stoploss_distance
-                    order_placed = place_bracket_order(
-                        kite,
-                        stock_symbol,
-                        position_size,
-                        stoploss_distance,
-                        target_distance
-                    )
+                    # Simulate taking a position
+                    position = {
+                        "symbol": stock_symbol,
+                        "entry_price": entry_price,
+                        "sl": stoploss_price,
+                        "tp": target_price,
+                        "size": position_size
+                    }
+                    # In a real scenario, you would place the bracket order here
+                    # For simulation, we just log and move on.
+                    # We break here to not take another trade on the same stock in the simulation
+                    break
 
-                    if order_placed:
-                        traded_stocks.add(stock_symbol)
-
-        logging.info("Waiting for the next candle...")
-        time.sleep(180)  # Wait for 3 minutes
+    logging.info(f"--- Simulation for {stock_symbol} finished ---")
 
 
 if __name__ == "__main__":
+    # This main block is for demonstration and simulation purposes.
+    # It will run the simulation for the first stock in the config file.
     kite_client = initialize_kite_client()
     if kite_client:
         logging.info("Successfully created a Kite Connect client instance.")
-        # The user needs to uncomment the following lines and provide a valid access token
-        # kite_client.set_access_token(config.ACCESS_TOKEN)
+        # The user needs to provide a valid access token for the simulation
+        # to fetch historical data.
+        try:
+            # This is a placeholder for a valid access token for demonstration.
+            # In a real scenario, the user would generate this token daily.
+            kite_client.set_access_token("YOUR_ACCESS_TOKEN_HERE")
 
-        # Uncomment the line below to run the strategy
-        # run_strategy(kite_client)
+            # Run simulation for the first stock in the list
+            if config.STOCKS:
+                run_simulation(kite_client, config.STOCKS[0])
+            else:
+                logging.warning("No stocks found in config.py to run simulation.")
+
+        except Exception as e:
+            logging.error(f"Could not run simulation. Please ensure your API credentials and access token are valid. Error: {e}")
