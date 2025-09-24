@@ -11,11 +11,11 @@ ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 
 # Strategy parameters
 STOCKS = ["INFY", "RELIANCE", "TCS"]  # Example stock symbols (NSE)
-SUPPORT_LEVELS = {
+BREAKOUT_LEVELS = {
     "INFY": 1500,
     "RELIANCE": 2500,
     "TCS": 3500,
-}  # Manually marked support levels
+}  # Manually marked breakout levels
 RISK_PER_TRADE = 1000  # in INR
 SQUARE_OFF_TIME = "15:15"  # 3:15 PM
 CANDLE_INTERVAL = "3minute"

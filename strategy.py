@@ -63,37 +63,36 @@ def get_historical_data(kite, instrument_token, interval, days=5):
         return pd.DataFrame()
 
 
-def check_breakout(df, support_level):
-    """Checks for a breakout condition."""
+def check_breakout(df, breakout_level):
+    """Checks for a long breakout condition."""
     if df.empty:
         return False, None
     last_candle = df.iloc[-1]
-    if last_candle["close"] < support_level:
-        logging.info(f"Breakout detected! Close: {last_candle['close']}, Support: {support_level}")
+    if last_candle["close"] > breakout_level:
+        logging.info(f"Breakout detected! Close: {last_candle['close']}, Level: {breakout_level}")
         return True, len(df) - 1
     return False, None
 
 
 def calculate_stoploss(df, breakout_candle_index, entry_price):
-    """Calculates the stoploss for a short position."""
-    # With the new simulation loop, breakout_candle_index will always be >= 2,
-    # so we can safely look back at the previous two candles.
+    """Calculates the stoploss for a long position."""
+    # Look at the two candles just before the breakout candle.
+    # breakout_candle_index is the index of the breakout candle itself.
+    # We need to look at indices breakout_candle_index-2 and breakout_candle_index-1.
+    previous_two_candles = df.iloc[breakout_candle_index - 2 : breakout_candle_index]
 
-    # Option 1: High of the last 2 candles *before* the breakout candle
-    # This will now correctly use the previous day's candle if the breakout
-    # happens early in the current day's session.
-    sl_price_candlestick = df["high"].iloc[breakout_candle_index - 2 : breakout_candle_index].max()
+    # Option 1: Lowest low of the two candles before the breakout.
+    sl_price_candlestick = previous_two_candles["low"].min()
 
-    # Option 2: 2% of the stock price
-    sl_price_percentage = entry_price * 1.02
+    # Option 2: 2% below the entry price.
+    sl_price_percentage = entry_price * 0.98
 
-    # For a short position, the stoploss is above the entry price.
-    # "Whichever is lower" means a tighter stoploss.
+    # The stoploss is the lower of these two values.
     final_sl = min(sl_price_candlestick, sl_price_percentage)
 
-    # Ensure SL is above entry price
-    if final_sl <= entry_price:
-        logging.warning(f"Calculated SL ({final_sl}) is not above entry price ({entry_price}). Using 2% rule as fallback.")
+    # Ensure SL is below entry price for a long trade.
+    if final_sl >= entry_price:
+        logging.warning(f"Calculated SL ({final_sl}) is not below entry price ({entry_price}). Using 2% rule as fallback.")
         return sl_price_percentage
 
     return final_sl
@@ -127,7 +126,7 @@ def place_market_order(kite, symbol, action, quantity):
 
 
 def place_bracket_order(kite, symbol, quantity, sl_distance, target_distance):
-    """Places a Bracket Order for a short position."""
+    """Places a Bracket Order for a long position."""
     logging.info(f"Placing Bracket Order for {quantity} shares of {symbol}.")
     logging.info(f"  SL distance: {sl_distance:.2f}, Target distance: {target_distance:.2f}")
     try:
@@ -135,7 +134,7 @@ def place_bracket_order(kite, symbol, quantity, sl_distance, target_distance):
             variety=kite.VARIETY_BO,
             exchange=kite.EXCHANGE_NSE,
             tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_SELL, # Short position
+            transaction_type=kite.TRANSACTION_TYPE_BUY,  # Long position
             quantity=quantity,
             product=kite.PRODUCT_MIS,
             order_type=kite.ORDER_TYPE_MARKET,
@@ -150,18 +149,18 @@ def place_bracket_order(kite, symbol, quantity, sl_distance, target_distance):
 
 
 def square_off_all_positions(kite):
-    """Squares off all open positions."""
+    """Squares off all open MIS positions."""
     logging.info("Squaring off all open positions...")
     try:
         positions = kite.positions().get("net", [])
         for pos in positions:
             if pos["quantity"] != 0 and pos["product"] == kite.PRODUCT_MIS:
-                # For short positions, quantity is negative
-                if pos["quantity"] < 0:
-                    place_market_order(kite, pos["tradingsymbol"], "BUY", abs(pos["quantity"]))
-                # The strategy is short-only, but as a safeguard:
-                elif pos["quantity"] > 0:
+                # For long positions, quantity is positive, so we sell.
+                if pos["quantity"] > 0:
                     place_market_order(kite, pos["tradingsymbol"], "SELL", pos["quantity"])
+                # As a safeguard for any stray short positions:
+                elif pos["quantity"] < 0:
+                    place_market_order(kite, pos["tradingsymbol"], "BUY", abs(pos["quantity"]))
         logging.info("All positions squared off.")
     except Exception as e:
         logging.error(f"Error squaring off positions: {e}")
@@ -174,9 +173,9 @@ def run_simulation(kite, stock_symbol, days=10):
     """
     logging.info(f"--- Running simulation for {stock_symbol} for the last {days} days ---")
 
-    support_level = config.SUPPORT_LEVELS.get(stock_symbol)
-    if not support_level:
-        logging.error(f"Support level not defined for {stock_symbol}. Cannot run simulation.")
+    breakout_level = config.BREAKOUT_LEVELS.get(stock_symbol)
+    if not breakout_level:
+        logging.error(f"Breakout level not defined for {stock_symbol}. Cannot run simulation.")
         return
 
     instrument_token = get_instrument_token(kite, stock_symbol)
@@ -210,7 +209,7 @@ def run_simulation(kite, stock_symbol, days=10):
 
         # --- ENTRY LOGIC ---
         if not position: # Only check for entries if we don't have a position
-            breakout, breakout_idx = check_breakout(current_dataframe_slice, support_level)
+            breakout, breakout_idx = check_breakout(current_dataframe_slice, breakout_level)
 
             if breakout:
                 entry_price = current_candle["close"]
@@ -219,12 +218,15 @@ def run_simulation(kite, stock_symbol, days=10):
                 if not stoploss_price:
                     continue
 
-                stoploss_distance = stoploss_price - entry_price
+                # For a long position, SL is below entry, so distance is positive
+                stoploss_distance = entry_price - stoploss_price
                 if stoploss_distance <= 0:
                     logging.warning(f"[{current_candle['date']}] Invalid SL distance ({stoploss_distance}). Skipping trade.")
                     continue
 
-                target_price = entry_price - (2 * stoploss_distance)
+                # Target is 2x the risk (stoploss distance)
+                target_distance = 2 * stoploss_distance
+                target_price = entry_price + target_distance
                 position_size = calculate_position_size(stoploss_distance)
 
                 if position_size > 0:
@@ -232,7 +234,7 @@ def run_simulation(kite, stock_symbol, days=10):
                     logging.info(f"  Stock: {stock_symbol}")
                     logging.info(f"  Entry: {entry_price:.2f}")
                     logging.info(f"  Stoploss: {stoploss_price:.2f} (Distance: {stoploss_distance:.2f})")
-                    logging.info(f"  Target: {target_price:.2f}")
+                    logging.info(f"  Target: {target_price:.2f} (Distance: {target_distance:.2f})")
                     logging.info(f"  Position Size: {position_size}")
 
                     # Simulate taking a position
