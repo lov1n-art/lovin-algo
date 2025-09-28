@@ -16,16 +16,22 @@ INSTRUMENTS = None
 
 
 def initialize_kite_client():
-    """Initializes the Kite Connect client."""
+    """Initializes the Kite Connect client or returns a simulated client if credentials are not available."""
+    if not config.API_KEY or config.API_KEY == "your_api_key_here":
+        from market_simulator import SimulatedKiteConnect
+        logging.info("Using simulated market data (API credentials not found)")
+        return SimulatedKiteConnect()
+    
     try:
         kite = KiteConnect(api_key=config.API_KEY)
-        # The following line is commented out as it requires a valid access token.
-        # kite.set_access_token(config.ACCESS_TOKEN)
-        logging.info("Kite Connect client initialized successfully.")
+        kite.set_access_token(config.ACCESS_TOKEN)
+        logging.info("Kite Connect client initialized successfully with real API.")
         return kite
     except Exception as e:
-        logging.error(f"Error initializing Kite Connect client: {e}")
-        return None
+        logging.warning(f"Error initializing real Kite Connect client: {e}")
+        logging.info("Falling back to simulation mode")
+        from market_simulator import SimulatedKiteConnect
+        return SimulatedKiteConnect()
 
 
 def get_instruments(kite, exchange="NSE"):
