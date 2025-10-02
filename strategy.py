@@ -16,19 +16,44 @@ INSTRUMENTS = None
 
 
 def initialize_kite_client():
-    """Initializes the Kite Connect client or returns a simulated client if credentials are not available."""
+    """Initializes the Kite Connect client with increased timeout."""
     if not config.API_KEY or config.API_KEY == "your_api_key_here":
         from market_simulator import SimulatedKiteConnect
         logging.info("Using simulated market data (API credentials not found)")
         return SimulatedKiteConnect()
     
     try:
-        kite = KiteConnect(api_key=config.API_KEY)
-        kite.set_access_token(config.ACCESS_TOKEN)
-        logging.info("Kite Connect client initialized successfully with real API.")
+        # Initialize with increased timeout
+        kite = KiteConnect(
+            api_key=config.API_KEY,
+            timeout=30  # Increased timeout to 30 seconds
+        )
+        
+        # Check if we have a valid access token
+        if config.ACCESS_TOKEN and config.ACCESS_TOKEN != "your_access_token_here":
+            kite.set_access_token(config.ACCESS_TOKEN)
+        else:
+            # Get new access token
+            login_url = kite.login_url()
+            logging.info(f"Please visit this URL to login: {login_url}")
+            request_token = input("Enter request token from redirect URL: ")
+            
+            data = kite.generate_session(request_token, api_secret=config.API_SECRET)
+            access_token = data["access_token"]
+            
+            # Save new access token
+            with open(".env", "w") as f:
+                f.write(f"KITE_API_KEY={config.API_KEY}\n")
+                f.write(f"KITE_API_SECRET={config.API_SECRET}\n")
+                f.write(f"KITE_ACCESS_TOKEN={access_token}")
+            
+            kite.set_access_token(access_token)
+        
+        logging.info("Kite Connect client initialized successfully")
         return kite
+        
     except Exception as e:
-        logging.warning(f"Error initializing real Kite Connect client: {e}")
+        logging.error(f"Error initializing Kite Connect client: {str(e)}")
         logging.info("Falling back to simulation mode")
         from market_simulator import SimulatedKiteConnect
         return SimulatedKiteConnect()
@@ -49,60 +74,127 @@ def get_instruments(kite, exchange="NSE"):
 
 def get_instrument_token(kite, symbol, exchange="NSE"):
     """Gets the instrument token for a given stock symbol."""
+    # Add exchange prefix if not already present
+    if not symbol.startswith(f"{exchange}:"):
+        trading_symbol = symbol
+        symbol = f"{exchange}:{symbol}"
+    else:
+        trading_symbol = symbol.split(":")[-1]
+        
     instruments = get_instruments(kite, exchange)
     if instruments:
         for instrument in instruments:
-            if instrument["tradingsymbol"] == symbol:
+            if instrument["tradingsymbol"] == trading_symbol:
+                logging.info(f"Found instrument token for {symbol}")
                 return instrument["instrument_token"]
+    
+    logging.error(f"Could not find instrument token for {symbol} in {exchange}")
     return None
 
 
 def get_historical_data(kite, instrument_token, interval, days=5):
     """Fetches historical data for a given instrument token."""
-    to_date = datetime.now().date()
+    to_date = datetime.now()
     from_date = to_date - timedelta(days=days)
     try:
         records = kite.historical_data(instrument_token, from_date, to_date, interval)
-        return pd.DataFrame(records)
+        df = pd.DataFrame(records)
+        if not df.empty:
+            # Convert timestamp to datetime and set as index
+            df['date'] = pd.to_datetime(df['date'], format='%Y-%m-%d %H:%M:%S')
+            df.set_index('date', inplace=True)
+        return df
     except Exception as e:
         logging.error(f"Error fetching historical data for token {instrument_token}: {e}")
         return pd.DataFrame()
 
 
+def calculate_stoploss(df_slice, breakout_idx, entry_price):
+    """
+    Calculate the stoploss price based on recent price action.
+    Returns the calculated stoploss price or None if it cannot be calculated.
+    """
+    if breakout_idx is None or breakout_idx >= len(df_slice):
+        return None
+
+    # Look at the last 3 candles before breakout to find the recent high
+    start_idx = max(0, breakout_idx - 3)
+    recent_candles = df_slice.iloc[start_idx:breakout_idx + 1]
+    
+    if len(recent_candles) < 1:
+        return None
+
+    # Use the highest high of recent candles as stoploss
+    stoploss_price = recent_candles["high"].max()
+    
+    # Ensure minimum stoploss distance (0.5% of entry price)
+    min_distance = entry_price * 0.005
+    if stoploss_price - entry_price < min_distance:
+        stoploss_price = entry_price + min_distance
+        
+    return stoploss_price
+
 def check_breakout(df, support_level):
-    """Checks for a breakout condition."""
+    """Checks for a breakout condition on 3-minute candle closings."""
     if df.empty:
         return False, None
+        
     last_candle = df.iloc[-1]
+    
+    # Get the candle timestamp from the index
+    candle_time = last_candle.name
+    
+    # Ensure we have a valid datetime
+    if not isinstance(candle_time, datetime):
+        logging.error(f"Invalid timestamp format: {candle_time}")
+        return False, None
+    
+    # Only check for breakouts on 3-minute candle closings
+    if candle_time.minute % 3 != 0:
+        logging.debug(f"Not a 3-minute candle close at {candle_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        return False, None
+        
     if last_candle["close"] < support_level:
-        logging.info(f"Breakout detected! Close: {last_candle['close']}, Support: {support_level}")
+        logging.info(f"Breakout detected on 3-minute candle close at {candle_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"Close: {last_candle['close']}, Support: {support_level}")
         return True, len(df) - 1
+        
     return False, None
 
 
-def calculate_stoploss(df, breakout_candle_index, entry_price):
-    """Calculates the stoploss for a short position."""
-    # With the new simulation loop, breakout_candle_index will always be >= 2,
-    # so we can safely look back at the previous two candles.
-
-    # Option 1: High of the last 2 candles *before* the breakout candle
-    # This will now correctly use the previous day's candle if the breakout
-    # happens early in the current day's session.
+def calculate_stoploss_and_targets(df, breakout_candle_index, entry_price):
+    """Calculates the stoploss and target levels for a short position using 1:2 risk-reward ratio."""
+    # Calculate stoploss
     sl_price_candlestick = df["high"].iloc[breakout_candle_index - 2 : breakout_candle_index].max()
-
-    # Option 2: 2% of the stock price
     sl_price_percentage = entry_price * 1.02
-
-    # For a short position, the stoploss is above the entry price.
-    # "Whichever is lower" means a tighter stoploss.
     final_sl = min(sl_price_candlestick, sl_price_percentage)
 
     # Ensure SL is above entry price
     if final_sl <= entry_price:
         logging.warning(f"Calculated SL ({final_sl}) is not above entry price ({entry_price}). Using 2% rule as fallback.")
-        return sl_price_percentage
+        final_sl = sl_price_percentage
 
-    return final_sl
+    # Calculate risk (distance to stoploss)
+    risk = final_sl - entry_price
+
+    # Calculate target (2x risk)
+    target_distance = risk * config.REWARD_RISK_RATIO
+    target_price = entry_price - target_distance
+
+    targets = {
+        "TARGET": {
+            "price": target_price,
+            "quantity": 1.0  # Full quantity exit at target
+        }
+    }
+
+    logging.info(f"Position Parameters:")
+    logging.info(f"  Entry: {entry_price:.2f}")
+    logging.info(f"  Stoploss: {final_sl:.2f} (Risk: {risk:.2f})")
+    logging.info(f"  Target: {target_price:.2f} (Reward: {target_distance:.2f})")
+    logging.info(f"  Risk:Reward = 1:{config.REWARD_RISK_RATIO}")
+
+    return final_sl, targets
 
 
 def calculate_position_size(stoploss_distance):
