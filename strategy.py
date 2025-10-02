@@ -16,16 +16,47 @@ INSTRUMENTS = None
 
 
 def initialize_kite_client():
-    """Initializes the Kite Connect client."""
+    """Initializes the Kite Connect client with increased timeout."""
+    if not config.API_KEY or config.API_KEY == "your_api_key_here":
+        from market_simulator import SimulatedKiteConnect
+        logging.info("Using simulated market data (API credentials not found)")
+        return SimulatedKiteConnect()
+    
     try:
-        kite = KiteConnect(api_key=config.API_KEY)
-        # The following line is commented out as it requires a valid access token.
-        # kite.set_access_token(config.ACCESS_TOKEN)
-        logging.info("Kite Connect client initialized successfully.")
+        # Initialize with increased timeout
+        kite = KiteConnect(
+            api_key=config.API_KEY,
+            timeout=30  # Increased timeout to 30 seconds
+        )
+        
+        # Check if we have a valid access token
+        if config.ACCESS_TOKEN and config.ACCESS_TOKEN != "your_access_token_here":
+            kite.set_access_token(config.ACCESS_TOKEN)
+        else:
+            # Get new access token
+            login_url = kite.login_url()
+            logging.info(f"Please visit this URL to login: {login_url}")
+            request_token = input("Enter request token from redirect URL: ")
+            
+            data = kite.generate_session(request_token, api_secret=config.API_SECRET)
+            access_token = data["access_token"]
+            
+            # Save new access token
+            with open(".env", "w") as f:
+                f.write(f"KITE_API_KEY={config.API_KEY}\n")
+                f.write(f"KITE_API_SECRET={config.API_SECRET}\n")
+                f.write(f"KITE_ACCESS_TOKEN={access_token}")
+            
+            kite.set_access_token(access_token)
+        
+        logging.info("Kite Connect client initialized successfully")
         return kite
+        
     except Exception as e:
-        logging.error(f"Error initializing Kite Connect client: {e}")
-        return None
+        logging.error(f"Error initializing Kite Connect client: {str(e)}")
+        logging.info("Falling back to simulation mode")
+        from market_simulator import SimulatedKiteConnect
+        return SimulatedKiteConnect()
 
 
 def get_instruments(kite, exchange="NSE"):

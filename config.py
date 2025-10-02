@@ -11,11 +11,16 @@ ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 
 # Strategy parameters
 STOCKS = ["INFY", "RELIANCE", "TCS"]  # Example stock symbols (NSE)
-BREAKOUT_LEVELS = {
-    "INFY": 1500,
-    "RELIANCE": 2500,
-    "TCS": 3500,
-}  # Manually marked breakout levels
+RESISTANCE_LEVELS = {
+    "INFY": 1600,
+    "RELIANCE": 2600,
+    "TCS": 3600,
+}  # Manually marked resistance levels for long breakouts
 RISK_PER_TRADE = 1000  # in INR
-SQUARE_OFF_TIME = "15:15"  # 3:15 PM
+SQUARE_OFF_TIME = "23:59"  # Extended for testing
 CANDLE_INTERVAL = "3minute"
+
+# Safety Mode Configuration
+SAFETY_MODE = True  # Set to False to enable real trading
+MAX_TRADES_PER_DAY = 3  # Maximum number of trades per day
+MAX_LOSS_PER_DAY = 3000  # Maximum loss per day in INR
