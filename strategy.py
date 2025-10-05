@@ -16,47 +16,16 @@ INSTRUMENTS = None
 
 
 def initialize_kite_client():
-    """Initializes the Kite Connect client with increased timeout."""
-    if not config.API_KEY or config.API_KEY == "your_api_key_here":
-        from market_simulator import SimulatedKiteConnect
-        logging.info("Using simulated market data (API credentials not found)")
-        return SimulatedKiteConnect()
-    
+    """Initializes the Kite Connect client."""
     try:
-        # Initialize with increased timeout
-        kite = KiteConnect(
-            api_key=config.API_KEY,
-            timeout=30  # Increased timeout to 30 seconds
-        )
-        
-        # Check if we have a valid access token
-        if config.ACCESS_TOKEN and config.ACCESS_TOKEN != "your_access_token_here":
-            kite.set_access_token(config.ACCESS_TOKEN)
-        else:
-            # Get new access token
-            login_url = kite.login_url()
-            logging.info(f"Please visit this URL to login: {login_url}")
-            request_token = input("Enter request token from redirect URL: ")
-            
-            data = kite.generate_session(request_token, api_secret=config.API_SECRET)
-            access_token = data["access_token"]
-            
-            # Save new access token
-            with open(".env", "w") as f:
-                f.write(f"KITE_API_KEY={config.API_KEY}\n")
-                f.write(f"KITE_API_SECRET={config.API_SECRET}\n")
-                f.write(f"KITE_ACCESS_TOKEN={access_token}")
-            
-            kite.set_access_token(access_token)
-        
-        logging.info("Kite Connect client initialized successfully")
+        kite = KiteConnect(api_key=config.API_KEY)
+        # The following line is commented out as it requires a valid access token.
+        # kite.set_access_token(config.ACCESS_TOKEN)
+        logging.info("Kite Connect client initialized successfully.")
         return kite
-        
     except Exception as e:
-        logging.error(f"Error initializing Kite Connect client: {str(e)}")
-        logging.info("Falling back to simulation mode")
-        from market_simulator import SimulatedKiteConnect
-        return SimulatedKiteConnect()
+        logging.error(f"Error initializing Kite Connect client: {e}")
+        return None
 
 
 def get_instruments(kite, exchange="NSE"):
@@ -199,48 +168,95 @@ def square_off_all_positions(kite):
 
 def run_simulation(kite, stock_symbol, days=10):
     """
-    Runs a backtest simulation for a single stock over a historical period.
-    This provides a stable way to test the strategy logic candle by candle.
+    Runs a backtest simulation with dual logic: standard breakout and gap-up
+    opening range breakout.
     """
     logging.info(f"--- Running simulation for {stock_symbol} for the last {days} days ---")
 
-    breakout_level = config.BREAKOUT_LEVELS.get(stock_symbol)
-    if not breakout_level:
-        logging.error(f"Breakout level not defined for {stock_symbol}. Cannot run simulation.")
+    manual_breakout_level = config.BREAKOUT_LEVELS.get(stock_symbol)
+    if not manual_breakout_level:
+        logging.error(f"Breakout level not defined for {stock_symbol}. Cannot run.")
         return
 
     instrument_token = get_instrument_token(kite, stock_symbol)
     if not instrument_token:
-        logging.error(f"Could not get instrument token for {stock_symbol}. Cannot run simulation.")
+        logging.error(f"Could not get instrument token for {stock_symbol}. Cannot run.")
         return
 
-    df = get_historical_data(kite, instrument_token, config.CANDLE_INTERVAL, days=days)
-    if df.empty:
+    # Fetch historical data for the entire period
+    # We add one extra day to ensure we have previous day's candles for SL calculation
+    df_full = get_historical_data(kite, instrument_token, config.CANDLE_INTERVAL, days=days + 1)
+    if df_full.empty:
         logging.error(f"Could not fetch historical data for {stock_symbol}. Aborting.")
         return
 
-    position = None
-    square_off_time = datetime.strptime(config.SQUARE_OFF_TIME, "%H:%M").time()
+    # Ensure 'date' is a datetime object
+    df_full['date'] = pd.to_datetime(df_full['date'])
 
-    # Loop through each candle of the historical data as if it's a live feed
-    for i in range(2, len(df)):
-        current_candle = df.iloc[i]
-        current_dataframe_slice = df.iloc[0:i+1] # Data up to the current candle
+    # Group data by day
+    daily_groups = df_full.groupby(df_full['date'].dt.date)
+    unique_days = list(daily_groups.groups.keys())
 
-        # --- POSITION MANAGEMENT ---
-        if position:
-            # Check for square-off time
-            if current_candle["date"].time() >= square_off_time:
-                logging.info(f"[{current_candle['date']}] Squaring off position in {stock_symbol} due to EOD.")
-                position = None # Simulate closing the position
-                continue # Move to the next day
+    # We need at least two days to have a previous day for SL calculation
+    if len(unique_days) < 2:
+        logging.warning("Not enough historical data to run a meaningful simulation (need at least 2 days).")
+        return
 
-            # In a real backtest, you would check for SL/TP hits here.
-            # For this simulation, we focus on the entry logic.
+    # Iterate through each day, starting from the second day
+    for day_index in range(1, len(unique_days)):
+        current_day_date = unique_days[day_index]
+        prev_day_date = unique_days[day_index - 1]
 
-        # --- ENTRY LOGIC ---
-        if not position: # Only check for entries if we don't have a position
-            breakout, breakout_idx = check_breakout(current_dataframe_slice, breakout_level)
+        df_today = daily_groups.get_group(current_day_date)
+        df_prev_day = daily_groups.get_group(prev_day_date)
+
+        # Combine previous day and current day for continuous SL calculation
+        df_combined = pd.concat([df_prev_day, df_today]).reset_index(drop=True)
+
+        logging.info(f"\n--- Processing Day: {current_day_date} ---")
+
+        # --- Determine Strategy for the Day ---
+        opening_candle = df_today.iloc[0]
+        breakout_level_for_the_day = manual_breakout_level
+        strategy_mode = "Standard Breakout"
+
+        # Check for Gap-Up condition
+        if opening_candle['open'] > manual_breakout_level:
+            strategy_mode = "Opening Range Breakout (Gap-Up)"
+            # Wait for the first 15 minutes (5 candles of 3-min)
+            opening_range_candles = df_today[df_today['date'].dt.time < datetime.strptime("09:30", "%H:%M").time()]
+            if len(opening_range_candles) >= 5:
+                breakout_level_for_the_day = opening_range_candles['high'].max()
+                logging.info(f"Gap-Up detected. New ORB level set to: {breakout_level_for_the_day:.2f}")
+            else:
+                logging.warning("Not enough candles for 15-min Opening Range. Skipping day.")
+                continue
+
+        logging.info(f"Mode for the day: {strategy_mode} | Level: {breakout_level_for_the_day:.2f}")
+
+        position_taken_today = False
+        square_off_time = datetime.strptime(config.SQUARE_OFF_TIME, "%H:%M").time()
+
+        # Iterate through the candles of the current day
+        for i in range(len(df_today)):
+            if position_taken_today:
+                break # Only one trade per day
+
+            # The current candle in the context of the combined (prev + today) dataframe
+            # This ensures we can always look back for SL calculation
+            combined_df_index = len(df_prev_day) + i
+            if combined_df_index < 2: # Need at least 2 previous candles
+                continue
+
+            current_candle = df_today.iloc[i]
+            current_dataframe_slice = df_combined.iloc[:combined_df_index + 1]
+
+            # Skip checks if in ORB mode and before 9:30 AM
+            if strategy_mode == "Opening Range Breakout (Gap-Up)" and current_candle['date'].time() < datetime.strptime("09:30", "%H:%M").time():
+                continue
+
+            # --- ENTRY LOGIC ---
+            breakout, breakout_idx = check_breakout(current_dataframe_slice, breakout_level_for_the_day)
 
             if breakout:
                 entry_price = current_candle["close"]
@@ -249,39 +265,29 @@ def run_simulation(kite, stock_symbol, days=10):
                 if not stoploss_price:
                     continue
 
-                # For a long position, SL is below entry, so distance is positive
                 stoploss_distance = entry_price - stoploss_price
                 if stoploss_distance <= 0:
-                    logging.warning(f"[{current_candle['date']}] Invalid SL distance ({stoploss_distance}). Skipping trade.")
+                    logging.warning(f"[{current_candle['date']}] Invalid SL distance ({stoploss_distance:.2f}). Skipping trade.")
                     continue
 
-                # Target is 2x the risk (stoploss distance)
                 target_distance = 2 * stoploss_distance
                 target_price = entry_price + target_distance
                 position_size = calculate_position_size(stoploss_distance)
 
                 if position_size > 0:
                     logging.info(f"--- TRADE SIGNAL on {current_candle['date']} ---")
-                    logging.info(f"  Stock: {stock_symbol}")
+                    logging.info(f"  Stock: {stock_symbol} ({strategy_mode})")
                     logging.info(f"  Entry: {entry_price:.2f}")
                     logging.info(f"  Stoploss: {stoploss_price:.2f} (Distance: {stoploss_distance:.2f})")
                     logging.info(f"  Target: {target_price:.2f} (Distance: {target_distance:.2f})")
                     logging.info(f"  Position Size: {position_size}")
 
-                    # Simulate taking a position
-                    position = {
-                        "symbol": stock_symbol,
-                        "entry_price": entry_price,
-                        "sl": stoploss_price,
-                        "tp": target_price,
-                        "size": position_size
-                    }
-                    # In a real scenario, you would place the bracket order here
-                    # For simulation, we just log and move on.
-                    # We break here to not take another trade on the same stock in the simulation
+                    position_taken_today = True # Simulate taking the position
+                    # In a real scenario, you'd place an order and manage the position.
+                    # We break here to simulate only one trade per day.
                     break
 
-    logging.info(f"--- Simulation for {stock_symbol} finished ---")
+    logging.info(f"\n--- Simulation for {stock_symbol} finished ---")
 
 
 if __name__ == "__main__":
